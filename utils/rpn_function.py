@@ -209,6 +209,7 @@ class RPNHead(nn.Module):
 
         return logits, bbox_reg
 
+
 def permute_and_flatten(layer, N, A, C, H, W):
     """
     permute and reshape tensors;
@@ -227,3 +228,263 @@ def permute_and_flatten(layer, N, A, C, H, W):
     layer = layer.reshape(N, -1, C)
 
     return layer
+
+
+def concat_box_prediction_layers(box_cls, box_regression):
+    """
+    box_cls, box_regression -> [N, -1, C]
+    :param box_cls: classification probability;
+    :param box_regression: bbox coordinates;
+    :return:
+    """
+    box_cls_flattened = []
+    box_regression_flatten = []
+
+    for box_cls_per_level, box_regression_per_level in zip(box_cls, box_regression):
+        # classes_num = 1
+        N, AxC, H, W = box_cls_per_level.shape
+        Ax4 = box_regression_per_level.shape[1]
+
+        A = Ax4 // 4  # anchors
+        C = AxC // A  # num_classes
+
+        # [N, -1, C]
+        box_cls_per_level = permute_and_flatten(box_cls_per_level, N, A, C, H, W)
+        box_cls_flattened.append(box_cls_per_level)
+
+        # [N, -1, C]
+        box_regression_per_level = permute_and_flatten(box_regression_per_level, N, A, 4, H, W)
+        box_regression_flatten.append(box_regression_per_level)
+
+    box_cls = torch.cat(box_cls_flattened, dim=1).flatten(0, -2)
+    box_regression = torch.cat(box_regression_flatten, dim=1).reshape(-1, 4)
+
+    return box_cls, box_regression
+
+
+class RegionProposalNetwork(nn.Module):
+    """
+    RPN Implementation;
+    """
+
+    __annotations__ = {
+        'box_coder': detect.BoxCoder,
+        'proposal_matcher': detect.Matcher,
+        'fg_bg_sampler': detect.BalancedPositiveNegativeSampler,
+        'pre_nms_top_n': Dict[str, int],
+        'post_nms_top_n': Dict[str, int]
+    }
+
+    def __init__(self, anchor_generator, head,
+                 fg_iou_thresh, bg_iou_thresh,
+                 batch_size_per_image, positive_fraction,
+                 pre_nms_top_n, post_nms_top_n,
+                 nms_thresh, score_thresh=0.0):
+        super(RegionProposalNetwork, self).__init__()
+        self.anchor_generator = anchor_generator
+        self.head = head
+        self.box_coder = detect.BoxCoder(weights=(1.0, 1.0, 1.0, 1.0))
+
+        # training
+        # compute similarity through IoU
+        self.box_similarity = box_ops.box_iou
+
+        self.proposal_matcher = detect.Matcher(
+            fg_iou_thresh,
+            bg_iou_thresh,
+            allow_low_quality_match=True
+        )
+
+        self.fg_bg_sampler = detect.BalancedPositiveNegativeSampler(
+            batch_size_per_image, positive_fraction
+        )
+
+        # testing
+        self._pre_nms_top_n = pre_nms_top_n
+        self._post_nms_top_n = post_nms_top_n
+        self.nms_thresh = nms_thresh
+        self.score_thresh = score_thresh
+        self.min_size = 1
+
+    def pre_nms_top_n(self):
+        if self.training:
+            return self._pre_nms_top_n['training']
+        return self._pre_nms_top_n['testing']
+
+    def post_nms_top_n(self):
+        if self.training:
+            return self._post_nms_top_n['training']
+        return self._post_nms_top_n['testing']
+
+    def assign_targets_to_anchors(self, anchors, targets):
+        """
+        match anchors to gt, sample positive, negative samples
+        :param anchors:
+        :param targets:
+        :return:
+        """
+        labels = []
+        matched_gt_boxes = []
+
+        for anchors_per_image, targets_per_image in zip(anchors, targets):
+            gt_boxes = targets_per_image["boxes"]
+            if gt_boxes.numel() == 0:
+                device = anchors_per_image.device
+                matched_gt_boxes_per_image = torch.zeros(anchors_per_image.shape, dtype=torch.float32, device=device)
+                labels_per_image = torch.zeros((anchors_per_image.shape[0],), dtype=torch.float32, device=device)
+            else:
+                # IoU between gt and anchors
+                match_quality_matrix = box_ops.box_iou(gt_boxes, anchors_per_image)
+                # get the biggest IoU indices
+                matched_idxs = self.proposal_matcher(match_quality_matrix)
+                # get the targets corresponding gt for each proposal
+                # set negative values to 0 to avoid out of bounds
+                matched_gt_boxes_per_image = gt_boxes[matched_idxs.clamp(min=0)]
+
+                # get positive samples
+                labels_per_image = matched_idxs >= 0
+                labels_per_image = labels_per_image.to(dtype=torch.float32)
+
+                # background samples
+                bg_indices = matched_idxs == self.proposal_matcher.BELOW_LOW_THRESHOLD
+                labels_per_image[bg_indices] = 0.0
+
+                # discard indices that are between the thresholds
+                inds_to_discard = matched_idxs == self.proposal_matcher.BETWEEN_THRESHOLDS
+                labels_per_image[inds_to_discard] = -1.0
+
+            labels.append(labels_per_image)
+            matched_gt_boxes.append(matched_gt_boxes_per_image)
+
+        return labels, matched_gt_boxes
+
+    def _get_top_n_idx(self, objectness, num_anchors_per_level):
+        """
+        get top n indices anchors;
+        :param objectness: object probability;
+        :param num_anchors_per_level:
+        :return:
+        """
+        r = []  # indices
+        offset = 0
+        for ob in objectness.split(num_anchors_per_level, 1):
+            if torchvision._is_tracing():
+                num_anchors, pre_nms_top_n = _onnx_get_num_anchors_and_pre_nms_top_n(ob, self.pre_nms_top_n())
+            else:
+                num_anchors = ob.shape[1]
+                pre_nms_top_n = min(self.pre_nms_top_n(), num_anchors)
+
+            # Returns the k largest elements of the given input tensor along a given dimension
+            _, top_n_idx = ob.topk(pre_nms_top_n, dim=1)
+            r.append(top_n_idx + offset)
+
+            offset += num_anchors
+
+        return torch.cat(r, dim=1)
+
+    def filter_proposals(self, proposals, objectness, image_shapes, num_anchors_per_level):
+        """
+        filter small bbox and nms, get post_nms_top_n targets;
+        :param proposals: bbox coordinates;
+        :param objectness: objectness confidence;
+        :param image_shapes: image size;
+        :param num_anchors_per_level: anchors num;
+        :return:
+        """
+        num_images = proposals.shape[0]
+        device = proposals.device
+
+        # avoid backprop when training
+        objectness = objectness.detach()
+        objectness = objectness.reshape(num_images, -1)
+
+        # Return a tensor of size filled with fill_value
+        # record indices of anchors on different prediction feature layers
+        levels = [torch.full((n,), idx, dtype=torch.int64, device=device) for idx, n in enumerate(num_anchors_per_level)]
+        levels = torch.cat(levels, dim=0)
+
+        # expand levels to the same size as objectness
+        levels = levels.reshape(1, -1).expand_as(objectness)
+
+        # get top pre_nms_top_n anchors indices
+        top_n_idx = self._get_top_n_idx(objectness, num_anchors_per_level)
+
+        image_range = torch.arange(num_images, device=device)
+        batch_idx = image_range[:, None]
+
+        # get top-n objectness
+        objectness = objectness[batch_idx, top_n_idx]
+        levels = levels[batch_idx, top_n_idx]
+        proposals = proposals[batch_idx, top_n_idx]
+
+        objectness_prob = torch.sigmoid(objectness)
+
+        final_boxes = []
+        final_scores = []
+
+        for boxes, scores, lvl, img_shape in zip(proposals, objectness_prob, levels, image_shapes):
+            # clip boxes to image
+            boxes = box_ops.clip_boxes_to_image(boxes, img_shape)
+            # remove small boxes
+            keep = box_ops.remove_small_boxes(boxes, self.min_size)
+            boxes, scores, lvl = boxes[keep], scores[keep], lvl[keep]
+
+            # remove low score boxes
+            keep = torch.where(torch.ge(scores, self.score_thresh))[0]
+            boxes, scores, lvl = boxes[keep], scores[keep], lvl[keep]
+
+            # nms
+            keep = box_ops.batched_nms(boxes, scores, lvl, self.nms_thresh)
+
+            # keep only top-k scoring predictions
+            keep = keep[:self.post_nms_top_n()]
+            boxes, scores = boxes[keep], scores[keep]
+
+            final_boxes.append(boxes)
+            final_scores.append(scores)
+
+        return final_boxes, final_scores
+
+    def compute_loss(self, objectness, pred_bbox_deltas, labels, regression_target):
+        # positive and negative samples indices
+        sampled_pos_inds, sampled_neg_inds = self.fg_bg_sampler(labels)
+
+        # get non-zero indices
+        sampled_pos_inds = torch.where(torch.cat(sampled_pos_inds, dim=0))[0]
+        sampled_neg_inds = torch.where(torch.cat(sampled_neg_inds, dim=0))[0]
+
+        # concat positive indices with negative indices
+        sampled_inds = torch.cat([sampled_pos_inds, sampled_neg_inds], dim=0)
+        objectness = objectness.flatten()
+
+        labels = torch.cat(labels, dim=0)
+        regression_target = torch.cat(regression_target, dim=0)
+
+        box_loss = detect.smooth_l1_loss(
+            pred_bbox_deltas[sampled_pos_inds],
+            regression_target[sampled_pos_inds],
+            beta=1/9,
+            size_average=False
+        ) / (sampled_inds.numel())
+
+        objectness_loss = F.binary_cross_entropy_with_logits(
+            objectness[sampled_inds], labels[sampled_inds]
+        )
+
+        return objectness_loss, box_loss
+
+    def forward(self,
+                images,
+                features,
+                targets=None):
+        features = list(features.values())
+        # get objectness and bbox coordinates
+        objectness, pred_bbox_deltas = self.head(features)
+
+        anchors = self.anchor_generator(images, features)
+
+        num_images = len(anchors)
+
+        # num_anchors_per_level
+
+
