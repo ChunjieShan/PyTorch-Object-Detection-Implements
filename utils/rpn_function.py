@@ -486,5 +486,35 @@ class RegionProposalNetwork(nn.Module):
         num_images = len(anchors)
 
         # num_anchors_per_level
+        num_anchors_per_level_shape_tensors = [o[0].shape for o in objectness]
+        num_anchors_per_level = [s[0] * s[1] * s[2] for s in num_anchors_per_level_shape_tensors]
+
+        # adjust tensors' format and shapes
+        objectness, pred_bbox_deltas = concat_box_prediction_layers(objectness, pred_bbox_deltas)
+
+        # apply pred_bbox_deltas to anchors to obtain the decoded proposals
+        # detach deltas to avoid backprop
+        proposals = self.box_coder.decode(pred_bbox_deltas.detach(), anchors)
+        proposals = proposals.view(num_images, -1, 4)
+
+        # get rid of small bbox, compute nms and get post nms top n targets
+        boxes, scores = self.filter_proposals(proposals, objectness, images.image_sizes, num_anchors_per_level)
+
+        losses = {}
+        if self.training:
+            assert targets is not None
+            # compute the most matchable gt
+            labels, matched_gt_boxes = self.assign_targets_to_anchors(anchors, targets)
+            regression_targets = self.box_coder.encode(matched_gt_boxes, anchors)
+            loss_objectness, loss_rpn_box_reg = self.compute_loss(
+                objectness, pred_bbox_deltas, labels, regression_targets
+            )
+
+            losses = {
+                "loss_objectness": loss_objectness,
+                "loss_rpn_box_reg": loss_rpn_box_reg
+            }
+
+        return boxes, losses
 
 
