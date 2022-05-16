@@ -111,4 +111,98 @@ class GeneralizedRCNNTransform(nn.Module):
     @torch.jit.unused
     def _onnx_batch_images(self, images, size_divisible=32):
         max_size = []
+        for i in range(images[0].dim()):
+            max_size_i = torch.max(torch.stack([img.shape[i] for img in images]).to(torch.float32)).to(torch.int64)
+            max_size.append(max_size_i)
+
+        stride = size_divisible
+        max_size[1] = (torch.ceil((max_size[1].to(torch.float32)) / stride) * stride).to(torch.int64)
+        max_size[2] = (torch.ceil((max_size[2].to(torch.float32)) / stride) * stride).to(torch.int64)
+        max_size = tuple(max_size)
+
+        padded_imgs = []
+        for img in images:
+            padding = [(s1 - s2) for s1, s2 in zip(max_size, tuple(img.shape))]
+            padded_img = torch.nn.functional.pad(img, [0, padding[2], 0, padding[1], 0, padding[0]])
+            padded_imgs.append(padded_img)
+
+        return torch.stack(padded_imgs)
+
+    def max_by_axis(self, the_list):
+        maxes = the_list[0]
+        for sublist in the_list[1:]:
+            for index, item in enumerate(sublist):
+                maxes[index] = max(maxes[index], item)
+        return maxes
+
+    def batch_images(self, images, size_divisible=32):
+        if torchvision._is_tracing():
+            return self._onnx_batch_images(images, size_divisible)
+
+        max_size = self.max_by_axis([list(img.shape) for img in images])
+        stride = float(size_divisible)
+        # make height and width be divisible by size_divisible
+        max_size[1] = int(math.ceil(float(max_size[1]) / stride) * stride)
+        max_size[2] = int(math.ceil(float(max_size[2]) / stride) * stride)
+
+        batch_shape = [len(images)] + max_size
+
+        batched_imgs = images[0].new_full(batch_shape, 0)
+        for img, pad_img in zip(images, batched_imgs):
+            pad_img[:, img.shape[0], :img.shape[1], :img.shape[2]].copy_(img)
+
+        return batched_imgs
+
+    def postprocess(self,
+                    result,
+                    image_shapes,
+                    original_image_sizes):
+        if self.training:
+            return result
+
+        for i, (pred, im_s, o_im_s) in enumerate(zip(result, image_shapes, original_image_sizes)):
+            boxes = pred["boxes"]
+            boxes = resize_boxes(boxes, im_s, o_im_s)
+            result[i]["boxes"] = boxes
+
+        return result
+
+    def __repr__(self):
+        format_string = self.__class__.__name__ + "("
+        _indent = '\n    '
+        format_string += "{0}Normalize(mean={1}, std={2})".format(_indent, self.image_mean, self.image_std)
+        format_string += "{0}Resize(min_size={1}, max_size={2}, mode='bilinear')".format(_indent, self.min_size,
+                                                                                         self.max_size)
+        format_string += "\n)"
+        return format_string
+
+    def forward(self,
+                images,
+                targets=None):
+        images = [img for img in images]
+        for i in range(len(images)):
+            image = images[i]
+            target_index = targets[i] if targets is not None else None
+
+            if image.dim() == 3:
+                raise ValueError("images is expected to be a list of 3d tensors "
+                                 "of shape [C, H, W], got {}".format(images.shape))
+
+            image = self.normalize(image)
+            image, target_index = self.resize(image, target_index)
+
+            if targets is not None and target_index is not None:
+                targets[i] = target_index
+
+        image_sizes = [img.shape[-2:] for img in images]
+        images = self.batch_images(images)
+        image_sizes_list = torch.jit.annotate(List[Tuple[int, int]], [])
+
+        for image_size in image_sizes:
+            assert len(image_size) == 2
+            image_sizes_list.append((image_size[0], image_size[1]))
+
+        image_list = ImageList(images, image_sizes_list)
+        return image_list, targets
+
 
